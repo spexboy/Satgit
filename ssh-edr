@@ -1,0 +1,168 @@
+Use case summary
+UC
+Use case
+MITRE
+Where it runs
+Initial action
+SSH-01
+sshd starts a shell running download or reverse-shell commands
+T1059.004 / T1105
+Custom IOA + CQL
+Detect, then Kill Process
+SSH-02
+Rogue sshd (non-standard path, port or config)
+T1543 / T1021.004
+Custom IOA + CQL
+Detect
+SSH-03
+authorized_keys or sshd_config tampering
+T1098.004
+Custom IOA + FileVantage
+Detect
+SSH-04
+SSH tunnelling or port forwarding (-R/-D/-w/-L)
+T1572
+Custom IOA + CQL
+Detect
+SSH-05
+SSH private key access
+T1552.004
+Custom IOA + CQL
+Detect
+SSH-06
+SSH brute force or password spray
+T1110.001/.003
+CQL correlation
+Alert
+SSH-07
+Successful login after multiple failures
+T1110 / T1078
+CQL correlation
+Alert
+SSH-08
+Root SSH login, or login from a public IP
+T1078 / T1021.004
+CQL correlation
+Alert
+SSH-09
+sshd listening on a port other than 22
+T1021.004 / T1205
+CQL correlation
+Alert
+Part A: Custom IOAs
+Where: Endpoint Security → Custom IOA Rule Groups → Create group → Platform Linux. Linux Custom IOAs support the Process Creation rule type. IOA regex must match the whole field, so keep the leading and trailing .* where shown.
+Rule
+Parent Image Filename
+Image Filename
+Command Line
+SSH-01
+.*/sshd(-session)?
+.*/(bash|sh|dash|zsh)
+.*\s-c\s.*(curl|wget|/dev/tcp/|nc\s|ncat|base64\s+-d|python[0-9.]*\s+-c|perl\s+-e|/tmp/|/dev/shm/).*
+SSH-02
+.*
+(/tmp|/var/tmp|/dev/shm|/home|/root)/(.*/)?sshd
+.*
+SSH-02b
+.*
+.*/sshd
+.*\s-(p|f|o)\s*\S+.*
+SSH-03
+.*
+.*/(bash|sh|sed|tee|cp|mv|chattr|chmod)
+.*(authorized_keys|sshd_config).*
+SSH-04
+.*
+.*/ssh
+.*\s-(R|D|w|L)\s*\S+.*
+SSH-05
+.*
+.*/(cat|cp|scp|tar|base64|xxd|curl)
+.*\.ssh/id_(rsa|dsa|ecdsa|ed25519)(\s.*)?
+Notes:
+In the Falcon console, type a plain | wherever the table shows \|. The backslash is only there so the table renders.
+sshd-session: OpenSSH 9.8 and later uses a separate sshd-session binary, which is why SSH-01 accepts it as the parent.
+SSH-02b: Don't add -D or -R. Normal systemd and re-exec launches use those flags, so they would trigger false positives.
+SSH-03: This will be noisy if you use Ansible, Puppet or cloud-init. Exclude those parents or service accounts with IOA exclusions.
+Rollout: Start every rule as Detect. After about 7 days of tuning, move SSH-01 to Kill Process.
+Assign: Enable the group and assign it to your Linux prevention policies.
+Part B: NG-SIEM correlation rules (CQL)
+Schedule each rule every 15 minutes with a 15–20 minute lookback.
+SSH-01: sshd starts a suspicious shell
+#event_simpleName=ProcessRollup2 event_platform=Lin
+| ParentBaseFileName=/^sshd(-session)?$/
+| FileName=/^(bash|sh|dash|zsh)$/ CommandLine=/\s-c\s/
+| CommandLine=/(curl|wget|\/dev\/tcp\/|\bnc\s|ncat|base64\s+-d|python[0-9.]*\s+-c|perl\s+-e|\/tmp\/|\/dev\/shm\/)/i
+| table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine])
+
+SSH-02: Rogue sshd
+#event_simpleName=ProcessRollup2 event_platform=Lin FileName=/^sshd$/
+| case {
+    ImageFileName!=/^\/usr\/sbin\/sshd$/ | Reason:="Non-standard sshd path";
+    CommandLine=/\s-(p\s*\d+|f\s|o\s)/ | Reason:="sshd with custom port/config/options";
+  }
+| table([@timestamp, ComputerName, UserName, ImageFileName, CommandLine, Reason])
+
+SSH-03: authorized_keys / sshd_config tampering
+#event_simpleName=ProcessRollup2 event_platform=Lin
+| CommandLine=/(>>?\s*\S*authorized_keys|tee\s.*(authorized_keys|sshd_config)|sed\s+-i.*sshd_config|PermitRootLogin\s+yes|PasswordAuthentication\s+yes|AuthorizedKeysFile)/i
+| table([@timestamp, ComputerName, UserName, ParentBaseFileName, FileName, CommandLine])
+
+Command-line detection only catches redirects that appear inside a bash -c call. For reliable coverage, add a FileVantage policy for:
+/etc/ssh/sshd_config
+/etc/ssh/sshd_config.d/*
+/root/.ssh/authorized_keys
+/home/*/.ssh/authorized_keys
+/usr/sbin/sshd
+SSH-04: SSH tunnelling
+#event_simpleName=ProcessRollup2 event_platform=Lin FileName=ssh
+| CommandLine=/\s-(R|D|w|L)\s*\S+|ProxyCommand|StrictHostKeyChecking=no|\s-N\b/
+| table([@timestamp, ComputerName, UserName, ParentBaseFileName, CommandLine])
+
+SSH-05: Private key access
+#event_simpleName=ProcessRollup2 event_platform=Lin
+| FileName=/^(cat|cp|scp|tar|base64|xxd|curl)$/
+| CommandLine=/\.ssh\/id_(rsa|dsa|ecdsa|ed25519)(\s|$)/
+| table([@timestamp, ComputerName, UserName, FileName, CommandLine])
+
+SSH-06: Brute force / spray
+#event_simpleName=UserLogonFailed2 event_platform=Lin
+| groupBy([aid, ComputerName, RemoteAddressIP4], function=[count(as=Failures), count(UserName, distinct=true, as=DistinctUsers), collect([UserName])])
+| Failures>=10 OR DistinctUsers>=5
+
+SSH-07: Success after failures
+#event_simpleName=/^(UserLogon|UserLogonFailed2)$/ event_platform=Lin RemoteAddressIP4=*
+| case { #event_simpleName=UserLogonFailed2 | Fail:=1; * | Success:=1; }
+| groupBy([aid, ComputerName, RemoteAddressIP4], function=[sum(Fail, as=Failures), sum(Success, as=Successes), collect([UserName])])
+| Failures>=5 Successes>=1
+
+SSH-08: Root login or public-IP login
+#event_simpleName=UserLogon event_platform=Lin RemoteAddressIP4=*
+| !cidr(RemoteAddressIP4, subnet=["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","127.0.0.0/8"]) OR UserName=root
+| table([@timestamp, ComputerName, UserName, RemoteAddressIP4])
+
+SSH-09: sshd listening on a port other than 22
+#event_simpleName=NetworkListenIP4 event_platform=Lin LocalPort!=22
+| join({#event_simpleName=ProcessRollup2 event_platform=Lin FileName=/^sshd(-session)?$/},
+       field=[aid, ContextProcessId], key=[aid, TargetProcessId], include=[ImageFileName, CommandLine])
+| table([@timestamp, ComputerName, LocalPort, ImageFileName, CommandLine])
+
+Validation commands (run on a test Linux host)
+UC
+Test
+SSH-01
+ssh user@testhost "bash -c 'curl http://example.com -o /tmp/t'"
+SSH-02
+cp /usr/sbin/sshd /tmp/sshd && /tmp/sshd -p 2222 -f /etc/ssh/sshd_config (as root, then kill it)
+SSH-03
+bash -c 'echo test >> ~/.ssh/authorized_keys' (revert afterwards)
+SSH-04
+ssh -N -R 9999:localhost:22 user@jumphost
+SSH-05
+cat ~/.ssh/id_rsa
+SSH-06/07
+About 10 failed SSH logins from one source, then one successful login
+SSH-09
+Same as SSH-02 (port 2222)
+Before you build the CQL rules, check whether your Linux sensors actually send UserLogon / UserLogonFailed2 with RemoteAddressIP4 filled in. Run #event_simpleName=UserLogonFailed2 event_platform=Lin | head(10) to see. If those fields are empty, SSH-06 to SSH-08 need /var/log/secure or auth.log ingested into NG-SIEM through a log collector, and the queries would need to be adapted to that log format.
+For references, CrowdStrike documents the Custom IOA rule and rule-group APIs if you want to deploy these as code (CrowdStrike Developer Center), and the community repo blueteam-ioa-rules has export/import scripts.
